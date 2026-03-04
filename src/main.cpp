@@ -27,6 +27,7 @@
 #include <TinyGPSPlus.h>
 #include <SD.h>
 #include <SPI.h>
+#include "Capture.h"
 
 // ============================================================
 // ハードウェア設定
@@ -225,6 +226,7 @@ bool baroCalibrated = false;
 
 // 気圧計キャリブレーション: GNSS 初回 Fix 時に offset を補正
 float baroOffset = 0.0f;
+float baroBootRaw = 0.0f;
 
 // 衛星数
 int satCount = 0;
@@ -237,6 +239,9 @@ unsigned long lastLogMs   = 0;
 bool sdReady = false;
 static constexpr int SD_CS_PIN = 4;
 static constexpr const char* LOG_PATH = "/altitude_log.csv";
+
+int counter;
+char fn[100];
 
 static void buildTimestamp(char* out, size_t outSize)
 {
@@ -387,7 +392,7 @@ static void drawDisplay()
     if (baroCalibrated) {
         snprintf(baroLbl, sizeof(baroLbl), "BMP280 (cal)");
     } else {
-        snprintf(baroLbl, sizeof(baroLbl), "BMP280");
+        snprintf(baroLbl, sizeof(baroLbl), "BMP280 (rel)");
     }
     drawSensorRow(ROW_BARO, COL_BARO,
                   "Baro Only", baroLbl,
@@ -450,6 +455,8 @@ void setup()
     M5.Display.setRotation(1);  // 横向き
     M5.Display.setBrightness(128);
 
+    counter = 0;
+
     showSplash("Initializing...");
 
     // デバッグシリアル
@@ -489,9 +496,11 @@ void setup()
 
         // 起動直後の気圧高度で EKF を初期化
         float rawAlt = bmp.readAltitude(SEA_LEVEL_HPA);
-        altBaro = rawAlt;
-        ekf.init(rawAlt);
-        Serial.printf("EKF initialized: h0=%.2f m\n", rawAlt);
+        baroBootRaw = rawAlt;
+        baroOffset = -baroBootRaw;  // GNSS未Fix時は起動地点を 0m とする
+        altBaro = rawAlt + baroOffset;
+        ekf.init(altBaro);
+        Serial.printf("EKF initialized: h0=%.2f m (baro relative, raw=%.2f m)\n", altBaro, rawAlt);
     }
 
     // IMU 初期化 (M5Unified が I2C バスをスキャンして GNSS Module 内蔵 BMI270 を自動検出)
@@ -549,7 +558,12 @@ void loop()
     if (gps.location.isValid() && gps.altitude.isValid()) {
         altGNSS = (float)gps.altitude.meters();
         satCount = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
-        gnssUpdated = gps.altitude.isUpdated();
+        static uint32_t lastFixSentenceCount = 0;
+        uint32_t fixSentenceCount = gps.sentencesWithFix();
+        gnssUpdated = (fixSentenceCount != lastFixSentenceCount);
+        if (gnssUpdated) {
+            lastFixSentenceCount = fixSentenceCount;
+        }
 
         if (!gnssValid) {
             Serial.printf("GNSS Fix! alt=%.2f m, sats=%d\n", altGNSS, satCount);
@@ -559,18 +573,15 @@ void loop()
         // 気圧高度オフセット補正: BMP280 の絶対値誤差を GNSS で校正
         // (BMP280 は相対変化は精度高いが絶対値は実際の海面気圧に依存するためオフセット補正)
         if (baroValid && gnssUpdated) {
-            static uint8_t gnssFixCount = 0;
             if (!baroCalibrated) {
-                // 初回: GNSS 高度が安定するまで 5 Fix 待ってから一度だけ合わせる
-                if (++gnssFixCount >= 5) {
-                    baroOffset = altGNSS - rawBaro;
-                    altBaro    = rawBaro + baroOffset;
-                    ekf.x[0]   = altGNSS;
-                    ekf.P[0][0] = 1.0f;
-                    baroCalibrated = true;
-                    Serial.printf("Baro calibrated: offset=%.2f m  (GNSS=%.2f, rawBaro=%.2f)\n",
-                                  baroOffset, altGNSS, rawBaro);
-                }
+                // 初回: 最初の有効 GNSS 更新で即時に絶対高度へ合わせる
+                baroOffset = altGNSS - rawBaro;
+                altBaro    = rawBaro + baroOffset;
+                ekf.x[0]   = altGNSS;
+                ekf.P[0][0] = 1.0f;
+                baroCalibrated = true;
+                Serial.printf("Baro calibrated: offset=%.2f m  (GNSS=%.2f, rawBaro=%.2f)\n",
+                              baroOffset, altGNSS, rawBaro);
             } else {
                 // キャリブレーション後: 気圧の長期ドリフトを緩やかに補正 (τ ≈ 100 sec)
                 baroOffset += 0.01f * ((altGNSS - rawBaro) - baroOffset);
@@ -619,6 +630,15 @@ void loop()
         );
     }
 
+    // ==========================================
+    // 6. ボタン A で スクリーンキャプチャ
+    // ==========================================
+    if(M5.BtnA.wasPressed()) {
+      sprintf(fn, "/Capture%d.bmp", counter);
+      Screen_Capture_BMP(fn);
+      counter++;
+    }
+    
     if (now - lastLogMs >= 1000) {
         lastLogMs = now;
         appendCsvLog();

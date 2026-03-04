@@ -63,6 +63,7 @@ timestamp_utc,uptime_ms,lat_deg,lon_deg,alt_gnss_m,alt_baro_m,alt_ekf_m,vel_mps,
 
 ## スクリーンショット
 
+![M5Stack altitude measurement display screenshot](./docs/screenshots/Capture0.png)
 
 ## EKFの目的
 
