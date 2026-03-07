@@ -27,6 +27,7 @@
 #include <TinyGPSPlus.h>
 #include <SD.h>
 #include <SPI.h>
+#include "AltitudeEKF.h"
 #include "Capture.h"
 
 // ============================================================
@@ -51,7 +52,7 @@ static constexpr float R_BARO = 0.09f;   // std ≈ 0.3 m
 
 // プロセスノイズ: IMU 加速度計ノイズ標準偏差 [m/s²]
 // BMI270 のノイズ特性に合わせて調整 (大きいほど IMU を信頼しない)
-static constexpr float Q_SIGMA_A = 0.3f;
+static constexpr float EKF_PROCESS_SIGMA_A = 0.3f;
 
 // 観測ノイズ分散 [m²]
 // GNSS 高度は精度 ~5m (ビル内/受信状況による)
@@ -97,113 +98,13 @@ struct BMP280Driver {
         int32_t adc_P = (int32_t)((buf[0]<<12)|(buf[1]<<4)|(buf[2]>>4));
         int32_t adc_T = (int32_t)((buf[3]<<12)|(buf[4]<<4)|(buf[5]>>4));
 
-        int32_t v1 = ((((adc_T>>3)-((int32_t)dig_T1<<1)))*((int32_t)dig_T2))>>11;
-        int32_t v2 = (((((adc_T>>4)-((int32_t)dig_T1))*((adc_T>>4)-((int32_t)dig_T1)))>>12)*((int32_t)dig_T3))>>14;
-        t_fine = v1 + v2;
-
-        double d1=(double)t_fine/2.0-64000.0, d2=d1*d1*(double)dig_P6/32768.0+d1*(double)dig_P5*2.0;
-        d2=d2/4.0+(double)dig_P4*65536.0;
-        d1=((double)dig_P3*d1*d1/524288.0+(double)dig_P2*d1)/524288.0;
-        d1=(1.0+d1/32768.0)*(double)dig_P1;
-        if (d1 == 0.0) return 0.0f;
-        double p=1048576.0-(double)adc_P;
-        p=(p-d2/4096.0)*6250.0/d1;
-        d1=(double)dig_P9*p*p/2147483648.0; d2=p*(double)dig_P8/32768.0;
-        p+=(d1+d2+(double)dig_P7)/16.0;
-
-        return 44330.0f*(1.0f-powf((float)(p/100.0)/seaLevel_hPa, 0.1903f));
+        const AltitudeMath::BMP280Calibration cal {
+            dig_T1, dig_T2, dig_T3,
+            dig_P1, dig_P2, dig_P3, dig_P4, dig_P5,
+            dig_P6, dig_P7, dig_P8, dig_P9
+        };
+        return AltitudeMath::readAltitude(cal, adc_P, adc_T, seaLevel_hPa, &t_fine);
     }
-};
-
-// ============================================================
-// 2 状態 EKF クラス
-// ============================================================
-//
-//  状態：x = [h (altitude), v (vertical velocity)]^T
-//
-//  遷移モデル (dt 秒ごとに予測):
-//    h_{k+1} = h_k + dt * v_k + 0.5 * dt² * a_z
-//    v_{k+1} = v_k + dt * a_z
-//      a_z: IMU から取得した重力補正済み垂直加速度 [m/s²]
-//
-//  観測モデル (高度センサ共通):
-//    z = h_k + noise    → H = [1, 0]
-//
-
-class AltitudeEKF {
-public:
-    float x[2];       // 状態ベクトル: [高度, 垂直速度]
-    float P[2][2];    // 共分散行列
-    bool  initialized = false;
-
-    // 初期化 (初期高度を設定)
-    void init(float h0) {
-        x[0] = h0;
-        x[1] = 0.0f;
-        P[0][0] = 100.0f; P[0][1] = 0.0f;
-        P[1][0] = 0.0f;   P[1][1] = 10.0f;
-        initialized = true;
-    }
-
-    // 予測ステップ: IMU 垂直加速度 az [m/s²], 時間刻み dt [s]
-    void predict(float az, float dt) {
-        // --- 状態遷移 ---
-        float new_h = x[0] + dt * x[1] + 0.5f * dt * dt * az;
-        float new_v = x[1] + dt * az;
-        x[0] = new_h;
-        x[1] = new_v;
-
-        // --- 共分散遷移 P = F * P * F^T + Q ---
-        // F = [[1, dt], [0, 1]]
-        // Q = σ_a² * [[dt⁴/4,  dt³/2],
-        //              [dt³/2,  dt²  ]]
-        float qa  = Q_SIGMA_A * Q_SIGMA_A;
-        float dt2 = dt * dt;
-        float dt3 = dt2 * dt;
-        float dt4 = dt3 * dt;
-
-        float p00 = P[0][0], p01 = P[0][1];
-        float p10 = P[1][0], p11 = P[1][1];
-
-        // F * P の各要素
-        float fp00 = p00 + dt * p10;
-        float fp01 = p01 + dt * p11;
-        float fp10 = p10;
-        float fp11 = p11;
-
-        // (F * P) * F^T + Q
-        P[0][0] = fp00 + dt * fp01 + 0.25f * dt4 * qa;
-        P[0][1] = fp01             + 0.5f  * dt3 * qa;
-        P[1][0] = fp10 + dt * fp11 + 0.5f  * dt3 * qa;
-        P[1][1] = fp11             +          dt2 * qa;
-    }
-
-    // 更新ステップ: 高度観測 z [m], 観測ノイズ分散 R [m²]
-    void update(float z, float R) {
-        // H = [1, 0] → S = H * P * H^T + R = P[0][0] + R
-        float S  = P[0][0] + R;
-        float K0 = P[0][0] / S;   // カルマンゲイン (高度)
-        float K1 = P[1][0] / S;   // カルマンゲイン (速度)
-
-        float innov = z - x[0];   // イノベーション (残差)
-        x[0] += K0 * innov;
-        x[1] += K1 * innov;
-
-        // P = (I - K * H) * P (Joseph 形式も可だが簡略版で十分)
-        float p00 = P[0][0], p01 = P[0][1];
-        float p10 = P[1][0], p11 = P[1][1];
-        P[0][0] = (1.0f - K0) * p00;
-        P[0][1] = (1.0f - K0) * p01;
-        P[1][0] = p10 - K1 * p00;
-        P[1][1] = p11 - K1 * p01;
-    }
-
-    // 推定高度 [m]
-    float altitude() const { return x[0]; }
-    // 推定垂直速度 [m/s]
-    float velocity() const { return x[1]; }
-    // 高度推定分散 (精度の目安) [m²]
-    float altVariance() const { return P[0][0]; }
 };
 
 // ============================================================
@@ -288,12 +189,12 @@ static void appendCsvLog()
         gnssAltStr,
         altBaro,
         altEKF,
-        ekf.initialized ? ekf.velocity() : 0.0f,
-        ekf.initialized ? ekf.altVariance() : 0.0f,
+        ekf.isInitialized() ? ekf.velocity() : 0.0f,
+        ekf.isInitialized() ? ekf.altVariance() : 0.0f,
         satCount,
         gnssValid ? 1 : 0,
         baroValid ? 1 : 0,
-        ekf.initialized ? 1 : 0
+        ekf.isInitialized() ? 1 : 0
     );
     file.close();
 }
@@ -400,19 +301,19 @@ static void drawDisplay()
 
     // --- EKF 融合行 ---
     char ekfExtra[48] = "";
-    if (ekf.initialized) {
+    if (ekf.isInitialized()) {
         snprintf(ekfExtra, sizeof(ekfExtra),
                  "vel:%.2f m/s  P:%.3f m²",
                  ekf.velocity(), ekf.altVariance());
     }
     drawSensorRow(ROW_EKF, COL_EKF,
                   "EKF Fusion", "GNSS+BMP280+BMI270",
-                  altEKF, ekf.initialized,
+                  altEKF, ekf.isInitialized(),
                   ekfExtra);
 
     // --- ステータスバー ---
     char statusBuf[80];
-    if (ekf.initialized && gnssValid && baroValid) {
+    if (ekf.isInitialized() && gnssValid && baroValid) {
         float diffGNSS = altGNSS - altEKF;
         float diffBaro = altBaro - altEKF;
         snprintf(statusBuf, sizeof(statusBuf),
@@ -462,6 +363,8 @@ void setup()
     // デバッグシリアル
     Serial.begin(115200);
     Serial.println("\n=== M5Stack EKF Altitude Fusion ===");
+
+    ekf.setProcessAccelSigma(EKF_PROCESS_SIGMA_A);
 
     sdReady = SD.begin(SD_CS_PIN, SPI, 25000000);
     if (sdReady) {
@@ -577,8 +480,7 @@ void loop()
                 // 初回: 最初の有効 GNSS 更新で即時に絶対高度へ合わせる
                 baroOffset = altGNSS - rawBaro;
                 altBaro    = rawBaro + baroOffset;
-                ekf.x[0]   = altGNSS;
-                ekf.P[0][0] = 1.0f;
+                ekf.alignAltitude(altGNSS, 1.0f);
                 baroCalibrated = true;
                 Serial.printf("Baro calibrated: offset=%.2f m  (GNSS=%.2f, rawBaro=%.2f)\n",
                               baroOffset, altGNSS, rawBaro);
@@ -593,7 +495,7 @@ void loop()
     // ==========================================
     // 4. EKF: 予測 → 更新
     // ==========================================
-    if (ekf.initialized) {
+    if (ekf.isInitialized()) {
         // 予測: IMU 加速度で状態を前進
         ekf.predict(az_inertial, dt);
 
@@ -624,8 +526,8 @@ void loop()
         Serial.printf(
             "GNSS=%7.2f  Baro=%7.2f  EKF=%7.2f  vel=%+6.3f  P=%.4f  sats=%d\n",
             altGNSS, altBaro, altEKF,
-            ekf.initialized ? ekf.velocity() : 0.0f,
-            ekf.initialized ? ekf.altVariance() : 0.0f,
+            ekf.isInitialized() ? ekf.velocity() : 0.0f,
+            ekf.isInitialized() ? ekf.altVariance() : 0.0f,
             satCount
         );
     }
